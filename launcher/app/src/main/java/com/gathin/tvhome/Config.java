@@ -63,6 +63,10 @@ final class Config {
     final List<String> hiddenApps;
     /** Packages pre-seeded into the App library's "added" set (config.xml, library_apps); empty by default. */
     final List<String> libraryApps;
+    /** Always listed in the App library even without a LAUNCHER entry (config.xml, library_catalog). */
+    final List<String> libraryCatalog;
+    /** Never listed in the App library (config.xml, library_exclude). */
+    final List<String> libraryExclude;
     /** Packages the App library catalogue never offers, even with app_library on (config.xml, library_excluded_apps). */
     final List<String> libraryExcludedApps;
     final String liveTvPackage;
@@ -282,7 +286,7 @@ final class Config {
     /** With single_row, the band runs behind every app in the row, not only the dock apps (config.xml, dock_band_all). */
     final boolean dockBandAll;
 
-    private Config(List<String> dockApps, boolean fillDock, List<String> hiddenApps, List<String> libraryApps, List<String> libraryExcludedApps, String liveTvPackage,
+    private Config(List<String> dockApps, boolean fillDock, List<String> hiddenApps, List<String> libraryApps, List<String> libraryCatalog, List<String> libraryExclude, List<String> libraryExcludedApps, String liveTvPackage,
                    String liveTvAction, String liveTvInputId, Map<String, String> launchActions, Map<String, String> appLabels,
                    Map<String, String> appBanners, String sourcePanelService, String sourcePanelAction,
                    String sourcePanelExtra, boolean coocaaSources, String inputAction, List<String> inputSources,
@@ -308,6 +312,8 @@ final class Config {
         this.fillDock = fillDock;
         this.hiddenApps = Collections.unmodifiableList(hiddenApps);
         this.libraryApps = Collections.unmodifiableList(libraryApps);
+        this.libraryCatalog = Collections.unmodifiableList(libraryCatalog);
+        this.libraryExclude = Collections.unmodifiableList(libraryExclude);
         this.libraryExcludedApps = Collections.unmodifiableList(libraryExcludedApps);
         this.liveTvPackage = liveTvPackage;
         this.liveTvAction = liveTvAction;
@@ -431,9 +437,14 @@ final class Config {
         return GLASS_HALO.equalsIgnoreCase(v) ? GLASS_HALO : GLASS_DEFAULT;
     }
 
-    /** The folder the theme tools push into; null when external storage is unavailable. */
+    /** The folder the theme tools push into; null when external storage is unavailable.
+     *  When that folder is not readable (this TV's shell-owned files), use the internal copy. */
     static File dir(Context ctx) {
-        return ctx.getExternalFilesDir(null);
+        File ext = ctx.getExternalFilesDir(null);
+        if (ext != null && new File(ext, FILE_NAME).canRead()) return ext;
+        File internal = new File(ctx.getFilesDir(), "theme");
+        if (new File(internal, FILE_NAME).isFile()) return internal;
+        return ext;
     }
 
     static Config load(Context ctx) {
@@ -442,6 +453,8 @@ final class Config {
         boolean fillDock = res.getBoolean(R.bool.fill_dock);
         List<String> hidden = new ArrayList<>(Arrays.asList(res.getStringArray(R.array.hidden_apps)));
         List<String> libraryApps = new ArrayList<>(Arrays.asList(res.getStringArray(R.array.library_apps)));
+        List<String> libraryCatalog = new ArrayList<>(Arrays.asList(res.getStringArray(R.array.library_catalog)));
+        List<String> libraryExclude = new ArrayList<>(Arrays.asList(res.getStringArray(R.array.library_exclude)));
         List<String> libraryExcludedApps = new ArrayList<>(Arrays.asList(res.getStringArray(R.array.library_excluded_apps)));
         String liveTv = res.getString(R.string.live_tv_package).trim();
         String liveTvAction = res.getString(R.string.live_tv_action).trim();
@@ -558,6 +571,8 @@ final class Config {
             fillDock = bool(json, "fill_dock", fillDock);
             hidden = stringList(json, "hidden_apps", hidden);
             libraryApps = stringList(json, "library_apps", libraryApps);
+            libraryCatalog = stringList(json, "library_catalog", libraryCatalog);
+            libraryExclude = stringList(json, "library_exclude", libraryExclude);
             libraryExcludedApps = stringList(json, "library_excluded_apps", libraryExcludedApps);
             liveTv = string(json, "live_tv_package", liveTv);
             liveTvAction = string(json, "live_tv_action", liveTvAction);
@@ -712,7 +727,7 @@ final class Config {
         Festival festival = json == null ? Festival.NONE : Festival.parse(festivalName(json),
                 string(json, "festival_until", ""), string(json, "greeting", ""), string(json, "accent_color", ""));
 
-        return new Config(dock, fillDock, hidden, libraryApps, libraryExcludedApps, liveTv, liveTvAction, liveTvInputId, packageMap(launchActions), packageMap(appLabels),
+        return new Config(dock, fillDock, hidden, libraryApps, libraryCatalog, libraryExclude, libraryExcludedApps, liveTv, liveTvAction, liveTvInputId, packageMap(launchActions), packageMap(appLabels),
                 packageMap(appBanners), panelService, panelAction, panelExtra, coocaaSources, inputAction, inputSources, inputUriScheme, Math.max(1, columns),
                 Math.max(0, rowsBelow), animations, advancedEffects, shamsi, greetingName, moduleCards, reducedMotion, bootToLiveTv,
                 openOnStartChoice, dockTitle, dockRow, topMenu, launcherSettingsButton, reorderButton, showNetworkPill, showInputsPill,

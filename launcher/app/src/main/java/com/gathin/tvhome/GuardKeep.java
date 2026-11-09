@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.PowerManager;
 import android.os.UserManager;
 import android.provider.Settings;
@@ -35,8 +36,11 @@ final class GuardKeep {
     }
 
     static boolean offInStandby(Context context) {
-        UserManager users = context.getSystemService(UserManager.class);
-        if (users != null && !users.isUserUnlocked()) return false;
+        // isUserUnlocked is Android 7; on API 23 the call is a missing method, not a false answer.
+        if (Build.VERSION.SDK_INT >= 24) {
+            UserManager users = context.getSystemService(UserManager.class);
+            if (users != null && !users.isUserUnlocked()) return false;
+        }
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_OFF, false);
     }
 
@@ -74,8 +78,14 @@ final class GuardKeep {
             }
             if (!found) {
                 entries.add(mine.flattenToShortString());
+                // String.join is Android 8.1; joining by hand keeps this working on API 23.
+                StringBuilder joined = new StringBuilder();
+                for (String entry : entries) {
+                    if (joined.length() > 0) joined.append(':');
+                    joined.append(entry);
+                }
                 Settings.Secure.putString(context.getContentResolver(),
-                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, String.join(":", entries));
+                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, joined.toString());
             }
             Settings.Secure.putInt(context.getContentResolver(), Settings.Secure.ACCESSIBILITY_ENABLED, 1);
         } catch (RuntimeException ignored) {

@@ -291,14 +291,22 @@ final class WallpaperPlayer {
             Bitmap decoded = BitmapFactory.decodeFile(file.getPath(), options);
             if (decoded == null) return null;
             if (dimColor != 0) new Canvas(decoded).drawColor(dimColor);
-            // One copy in GPU memory instead of a software bitmap plus its texture; the decode stays off the UI
-            // thread for rotations, and Home's return no longer uploads 4-8 MB to the GPU.
+            return toHardware(decoded);
+        } catch (Exception | OutOfMemoryError failure) {
+            return null;
+        }
+    }
+
+    /** GPU bitmaps exist only from Android 8. On Android 6 that field is missing and crashes Home. */
+    private static Bitmap toHardware(Bitmap decoded) {
+        if (android.os.Build.VERSION.SDK_INT < 26) return decoded;
+        try {
             Bitmap gpu = decoded.copy(Bitmap.Config.HARDWARE, false);
             if (gpu == null) return decoded;
             decoded.recycle();
             return gpu;
-        } catch (Exception | OutOfMemoryError failure) {
-            return null;
+        } catch (Throwable ignored) {
+            return decoded;
         }
     }
 }

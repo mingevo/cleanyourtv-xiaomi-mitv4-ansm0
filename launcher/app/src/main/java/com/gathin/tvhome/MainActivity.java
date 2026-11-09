@@ -11,10 +11,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.IntentFilter;
-import android.content.pm.PackageManager;
 import android.content.pm.ApplicationInfo;
-import android.content.pm.ResolveInfo;
 import android.content.pm.ChangedPackages;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
@@ -108,6 +108,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     static final String ACTION_APP_LIBRARY = "com.gathin.tvhome.action.APP_LIBRARY";
     /** The system input switcher, forwarded here by InputsRequestActivity while handle_view_inputs is on. */
     static final String ACTION_VIEW_INPUTS = "com.android.tv.action.VIEW_INPUTS";
+    /** Long-press Home: open the app library instead of the firmware's cloud-sync screen. */
+    static final String EXTRA_OPEN_LIBRARY = "com.gathin.tvhome.OPEN_LIBRARY";
     /** Tiles per row and dock slots (res/values/config.xml, columns). Set in onCreate. */
     static int COLUMNS = 4;
     private boolean rtlAppGrid;
@@ -131,6 +133,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private String liveTvInputId;
     /** The app library is on (config.xml, app_library): only then can the tile menu take an app off Home. */
     private boolean appLibraryEnabled;
+    private List<String> libraryCatalog = Collections.emptyList();
+    private List<String> libraryExclude = Collections.emptyList();
     /** The same opt-in menu is available from either hold-OK or the remote's Menu key. */
     private boolean tileMenuEnabled;
     private String inputAction;
@@ -194,6 +198,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private TextView shamsiDate;
     /** lunar_date: the lunisolar date under the date line, and the time zone it is computed for. */
     private TextView lunarDate;
+    private TextView weatherLine;
     private boolean lunar;
     private int lunarOffset;
     private TextView stats;
@@ -243,6 +248,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
      */
     private final Rect glassCardRect = new Rect();
     private boolean glassShown;
+    /** False until the dock padding is already applied, so the highlight is not drawn and then slid onto the tile. */
+    private boolean gridReady;
     private final Rect tileRect = new Rect();
     private final Rect revealRect = new Rect();
     // Static so they survive the activity being destroyed while another app is open (low-memory TVs,
@@ -453,13 +460,32 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private String clockFormat = "system";
     private java.util.Map<Integer, String> homeHoldAppKeys = java.util.Collections.emptyMap();
 
+    /** Android 7+. On Android 6 the view keeps its offscreen buffer. */
+    private static void skipOffscreen(View view) {
+        if (Build.VERSION.SDK_INT >= 24) view.forceHasOverlappingRendering(false);
+    }
+
+    /** Android 7+. On Android 6 an input is shown even if a newer system would hide it. */
+    private boolean inputHidden(TvInputInfo info) {
+        return Build.VERSION.SDK_INT >= 24 && info.isHidden(this);
+    }
+
+    /** Android 7+. On Android 6 the port keeps the name from loadLabel. */
+    private CharSequence customLabel(TvInputInfo info) {
+        return Build.VERSION.SDK_INT >= 24 ? info.loadCustomLabel(this) : null;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         density = getResources().getDisplayMetrics().density;
         // config.xml, overlaid by config.json from a pushed theme (see Config and tools/theme.sh).
+        // This TV's shell can write the theme folder but the launcher cannot read those files, so a
+        // copy staged in /data/local/tmp is brought into the app's own storage first.
+        ThemeImport.bringIn(this);
         Config cfg = Config.load(this);
+        android.util.Log.i("Weather", "wallpapers " + cfg.wallpapers.size());
         homeAppKeys = RemoteKeys.parseAppKeys(cfg.appKeys);
         clockFormat = cfg.clockFormat;
         ClockFormat.apply(getWindow().getDecorView(), clockFormat);
@@ -494,6 +520,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         liveTvAction = cfg.liveTvAction;
         liveTvInputId = cfg.liveTvInputId;
         appLibraryEnabled = cfg.appLibrary;
+        libraryCatalog = cfg.libraryCatalog;
+        libraryExclude = cfg.libraryExclude;
         tileMenuEnabled = cfg.tileMenu;
         inputAction = cfg.inputAction;
         inputSources = cfg.inputSources;
@@ -518,7 +546,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         ambient = findViewById(R.id.ambient);
         // The glow is one bitmap, so its alpha can be applied while drawing it. Otherwise every frame of
         // a fade renders it into a full-screen offscreen buffer first.
-        ambient.forceHasOverlappingRendering(false);
+        skipOffscreen(ambient);
         ambientGlow = cfg.ambientGlow;
         glowSnap = cfg.glowSnap;
         appGlow = cfg.appGlow;
@@ -527,10 +555,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         hero = findViewById(R.id.hero);
         // The hero is now a group (name, and the cinematic lines): without this every fade of the default
         // shelf would render it through an offscreen buffer first, as the glow above notes.
-        hero.forceHasOverlappingRendering(false);
+        skipOffscreen(hero);
         heroMeta = findViewById(R.id.heroMeta);
         heroDots = findViewById(R.id.heroDots);
         heroArt = findViewById(R.id.heroArt);
+        ambientGlow = cfg.ambientGlow;
+        appGlow = cfg.appGlow;
+        if (!ambientGlow) ambient.setVisibility(View.GONE);
         cinematic = cfg.cinematicHome;
         glowStyle = cfg.glowStyle;
         heroDotsShown = cfg.cinematicDots;
@@ -589,6 +620,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         inputsCecStateOnly = cfg.inputsCecStateOnly;
         shamsi = cfg.shamsiDate;
         lunarDate = findViewById(R.id.lunarDate);
+        weatherLine = findViewById(R.id.weather);
         lunar = cfg.lunarDate;
         lunarOffset = Lunar.offsetFor(cfg.lunarUtcOffset, Locale.getDefault());
         if (lunar) lunarDate.setVisibility(View.VISIBLE);
@@ -727,8 +759,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 grid.setPadding(grid.getPaddingLeft(), want, grid.getPaddingRight(), grid.getPaddingBottom());
                 // A vertical grid parks the dock on the new padding line by scrolling (onTileFocused); a sideways
                 // row cannot scroll vertically, and the layout request made from inside this layout pass is
-                // dropped, so lay the row out again on the next frame. The glass and the title were placed for the
-                // old position, so fit them again once it has moved.
+                // dropped, so lay the row out again on the next frame. The glass stays hidden until that pass.
                 if (singleRow) grid.post(() -> {
                     grid.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
                         @Override
@@ -742,9 +773,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     });
                     grid.requestLayout();
                 });
+            } else if (h > 0) {
+                gridReady = true;
             }
-            // Cold start or column count > 4: the first focus can run before the grid has its final width or
-            // padding, leaving the glass at the XML design size until a key is pressed.
             grid.post(this::refitGlass);
         });
 
@@ -959,15 +990,23 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
         if (tim != null) tim.registerCallback(inputCallback, handler);
         if (cm != null) {
-            cm.registerDefaultNetworkCallback(networkCallback);
+            // registerDefaultNetworkCallback is Android 7. On Android 6, watch any network that has internet.
+            if (Build.VERSION.SDK_INT >= 24) {
+                cm.registerDefaultNetworkCallback(networkCallback);
+            } else {
+                cm.registerNetworkCallback(new NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .build(), networkCallback);
+            }
             cm.registerNetworkCallback(new NetworkRequest.Builder()
                     .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
                     .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                     .build(), vpnCallback);
         }
         // Not after recreate(): the launch intent survives it and would open the settings again.
-        if (savedInstanceState == null && !openLauncherSettingsIfAsked(getIntent()) && !openLibraryIfAsked(getIntent())) {
-            openInputsIfAsked(getIntent());
+        if (savedInstanceState == null && !openLauncherSettingsIfAsked(getIntent())
+                && !openInputsIfAsked(getIntent())) {
+            openLibraryIfAsked(getIntent());
         }
     }
 
@@ -1026,7 +1065,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
      * is replaced so a later recreate() does not open it again. With app_library off there is no library, so the
      * press only brings Home forward.
      */
-    private boolean openLibraryIfAsked(Intent intent) {
+    private boolean openLibraryByAction(Intent intent) {
         if (intent == null || !ACTION_APP_LIBRARY.equals(intent.getAction())) return false;
         setIntent(new Intent(Intent.ACTION_MAIN));
         if (!appLibraryEnabled) return true;
@@ -1051,6 +1090,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        setIntent(intent);
+        if (openLibraryByAction(intent)) return;
         if (openLauncherSettingsIfAsked(intent)) return;
         if (openLibraryIfAsked(intent)) return;
         if (openInputsIfAsked(intent)) return;
@@ -1079,6 +1120,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             registerReceiver(timeReceiver, timeFilter);
         }
         updateClockVisibility();
+        if (weatherLine != null) Weather.show(weatherLine);
         clockRefresh.start();   // with timeReceiver: while Home is visible, paused or not
         tileRefresh.onStart();
     }
@@ -1086,6 +1128,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onResume() {
         super.onResume();
+        // Back on Home: the stock launcher was left, so Home redirects again from here on.
+        HomeKeyService.leaveStockHome();
         resumed = true;
         // A festival that started or ended while Home was in the background: rebuild with or without it.
         if (festive != festival.active(LocalDate.now())) {
@@ -1235,11 +1279,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
 
     /** True when PackageManager reports apps changed since the last rebuild (one binder call). */
     private boolean packagesChangedSinceRebuild() {
+        if (Build.VERSION.SDK_INT < 26) return true;
         ChangedPackages changed = getPackageManager().getChangedPackages(packageSequence);
         return changed != null && !changed.getPackageNames().isEmpty();
     }
 
     private int currentPackageSequence(int since) {
+        if (Build.VERSION.SDK_INT < 26) return since;
         ChangedPackages changed = getPackageManager().getChangedPackages(since);
         return changed != null ? changed.getSequenceNumber() : since;
     }
@@ -1496,6 +1542,119 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         View f = getCurrentFocus();
         if (f == null || f.getId() != R.id.card || !(f.getParent() instanceof View)) return -1;
         return grid.getChildAdapterPosition((View) f.getParent());
+    }
+
+    /** Hold OK opened the tile menu; the key-up must not also open the app. */
+    private boolean suppressTileClick;
+
+    /**
+     * Hold OK on a tile opens its menu. A short press still opens the app. While reordering, OK is
+     * left to that mode.
+     */
+    private boolean handleTileMenuKey(KeyEvent event) {
+        int code = event.getKeyCode();
+        boolean ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
+                || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
+        if (!ok) return false;
+        if (event.getAction() == KeyEvent.ACTION_UP) {
+            if (!suppressTileClick) return false;
+            suppressTileClick = false;
+            return true;
+        }
+        if (event.getRepeatCount() == 0 && !event.isLongPress()) return false;
+        int pos = focusedTilePosition();
+        if (pos < 0) return false;
+        if (!suppressTileClick) {
+            View card = getCurrentFocus();
+            showAppMenu(pos, card == null ? null : card);
+        }
+        suppressTileClick = true;
+        return true;
+    }
+
+    @Override
+    public boolean onTileLongClick(int position, View card) {
+        if (reordering) return true;
+        showAppMenu(position, card);
+        suppressTileClick = true;
+        return true;
+    }
+
+    /** Hold OK: uninstall a downloaded app, or open its system page. System apps only offer the page. */
+    private void showAppMenu(int position, View anchor) {
+        if (isFinishing() || anchor == null || reordering) return;
+        if (openPopup != null && openPopup.isShowing()) return;
+        String pkg = adapter.packageAt(position);
+        if (pkg == null) return;
+        String label = adapter.labelAt(position);
+        View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
+        LinearLayout rows = panel.findViewById(R.id.rows);
+        PopupWindow popup = glassPopup(panel, (int) (200 * density));
+        if (uninstallable(pkg)) addSettingsMenuRow(rows, popup, R.string.uninstall_app, () -> uninstall(pkg, label));
+        addSettingsMenuRow(rows, popup, R.string.library_app_info, () -> openAppInfo(pkg, label));
+        panel.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+        popup.setWidth(Math.max((int) (160 * density), panel.getMeasuredWidth()));
+        hideGlass();
+        // Window coordinates, not screen coordinates: this TV has a status bar, and screen
+        // coordinates put the menu a bar's height away from the tile. Above the tile when it
+        // would not fit below, same as the reorder menu.
+        int[] at = new int[2];
+        anchor.getLocationInWindow(at);
+        int gap = (int) (10 * density);
+        int height = panel.getMeasuredHeight();
+        if (at[1] + anchor.getHeight() + gap + height <= root.getHeight()) {
+            dropIn(popup, panel, anchor, Gravity.START);
+        } else {
+            panel.setAlpha(0f);
+            panel.setPivotY(height);
+            panel.setScaleY(0.92f);
+            panel.setTranslationY(8 * density);
+            popup.showAtLocation(root, Gravity.NO_GRAVITY, at[0], Math.max(0, at[1] - gap - height));
+            panel.animate().alpha(1f).scaleY(1f).translationY(0f).setDuration(220)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f)).start();
+        }
+        rows.getChildAt(0).requestFocus();
+    }
+
+    private boolean openLibraryIfAsked(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra(EXTRA_OPEN_LIBRARY, false)) return false;
+        intent.removeExtra(EXTRA_OPEN_LIBRARY);
+        setIntent(intent);
+        if (openPopup != null) openPopup.dismiss();
+        root.post(this::onLibraryRequested);
+        return true;
+    }
+
+    /** A downloaded app. The launcher itself, and apps built into the system, stay. */
+    private boolean uninstallable(String pkg) {
+        if (pkg == null || pkg.equals(getPackageName())) return false;
+        try {
+            ApplicationInfo info = getPackageManager().getApplicationInfo(pkg, 0);
+            return (info.flags & ApplicationInfo.FLAG_SYSTEM) == 0;
+        } catch (PackageManager.NameNotFoundException ignored) {
+            return false;
+        }
+    }
+
+    private void uninstall(String pkg, String label) {
+        Intent intent = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + pkg));
+        if (getPackageManager().resolveActivity(intent, 0) == null) {
+            intent = new Intent(Intent.ACTION_UNINSTALL_PACKAGE, Uri.parse("package:" + pkg));
+        }
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException | SecurityException e) {
+            Toast.makeText(this, getString(R.string.cant_open, label), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void openAppInfo(String pkg, String label) {
+        Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg));
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException | SecurityException e) {
+            Toast.makeText(this, getString(R.string.cant_open, label), Toast.LENGTH_SHORT).show();
+        }
     }
 
     /** The reorder button: turns the mode on (focus goes back to the last tile), or off again. */
@@ -1775,7 +1934,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         libraryFocusPending = false;
         libraryFromTopBar = false;
         libraryFromVpnPill = false;
-        appLibrary = new AppLibraryDialog(this, animations, reducedMotion, appLibrarySelection, libraryOkOpens, adapter::containsPackage, () -> reloadApps(false), () -> {
+        appLibrary = new AppLibraryDialog(this, animations, reducedMotion, appLibrarySelection, libraryOkOpens,
+                libraryCatalog, libraryExclude, adapter::containsPackage, adapter.stockHomePackage(),
+                () -> reloadApps(false), () -> {
             appLibrary = null;
             openPopup = null;
             if (libraryFromTopBar) {
@@ -1844,13 +2005,23 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             glassAccent = accent;
             glass.setAccent(accent);
         }
-        if (!glassShown) {
+        if (!gridReady) {
+            // The dock has not been pushed down yet. Keep the highlight invisible so it does not
+            // appear on the app name and then slide onto the first tile.
             springX.cancel();
             springY.cancel();
+            glass.animate().cancel();
             glass.setTranslationX(x);
             glass.setTranslationY(y);
-            if (animations && !reducedMotion) glass.animate().alpha(1f).setDuration(180).start();
-            else glass.setAlpha(1f);
+            glass.setAlpha(0f);
+            glassShown = false;
+        } else if (!glassShown) {
+            springX.cancel();
+            springY.cancel();
+            glass.animate().cancel();
+            glass.setTranslationX(x);
+            glass.setTranslationY(y);
+            glass.setAlpha(1f);
             glassShown = true;
         } else if (!animations) {
             springX.cancel();
@@ -1876,10 +2047,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             }
             showHero(position, scroll ? r.top - dy : r.top);
         } else {
-            // Below the dock (or in a plain grid) the glow follows the tile without the big name; letting it
-            // fade out left the grid on plain black.
+            // Below the dock the glow follows the tile. The row stays where it is when it is already
+            // on screen; only a row past the edge scrolls in.
             showGlowOnly(position);
-            // Scroll just enough so the whole glass (not only the tile) is visible.
             revealRect.set(0, -(int) pad * 2, item.getWidth(), item.getHeight() + (int) pad);
             grid.requestChildRectangleOnScreen(item, revealRect, reducedMotion);
         }
@@ -1998,8 +2168,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         heroDots.setVisibility(heroDotsShown ? View.VISIBLE : View.GONE);
         heroArt.setVisibility(heroArtAlpha > 0f ? View.VISIBLE : View.GONE);
         // One stretched bitmap: apply its alpha while drawing instead of through an offscreen buffer.
-        heroArt.forceHasOverlappingRendering(false);
-        if (scrimPercent <= 0) return;   // cinematic_scrim 0: no scrim at all
+        skipOffscreen(heroArt);
         View scrim = findViewById(R.id.heroScrim);
         Drawable shade = scrimDrawable();
         // On the bitmap's paint, not the view: a view's alpha would draw the full screen through an offscreen buffer.
@@ -2314,7 +2483,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (mem != null) appendStat(line, getString(R.string.stats_memory, mem[0], mem[1]));
         String free = formatGb(getResources(), Environment.getDataDirectory().getFreeSpace());
         if (!free.isEmpty()) appendStat(line, getString(R.string.stats_storage, free));
-        return StatsText.forLocale(line.toString(), getResources().getConfiguration().getLocales().get(0));
+        return StatsText.forLocale(line.toString(), configLocale());
     }
 
     // -1: need another sample. -2: this source cannot be read (Android 9 hides /proc/stat from apps).
@@ -2720,6 +2889,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         }
     }
 
+    /** Configuration.getLocales is Android 7. Android 6 only has the single locale field. */
+    private Locale configLocale() {
+        android.content.res.Configuration configuration = getResources().getConfiguration();
+        if (Build.VERSION.SDK_INT >= 24) return configuration.getLocales().get(0);
+        return configuration.locale;
+    }
+
     private void updateGreeting() {
         int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
         int res;
@@ -2728,7 +2904,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // Spain (es-ES) and Catalan: "Buenas tardes" into the evening; "Buenas noches" from 21.
         // Latin American Spanish (es-MX, es-AR, …) keeps the default hours: evening strings are also
         // «Buenas noches», and there «Buenas noches» from ~17 matches local use better than Spain's 21.
-        Locale locale = getResources().getConfiguration().getLocales().get(0);
+        Locale locale = configLocale();
         String lang = locale.getLanguage();
         String country = locale.getCountry();
         if ("in".equals(lang) || "id".equals(lang)) {
@@ -3204,17 +3380,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
 
     /** Hides the Inputs pill when it would have nothing to list: streaming boxes have no HDMI-in, AV or tuner. */
     private void updateInputsButton() {
-        if (!showInputsPill) {
-            btnInputs.setVisibility(View.GONE);
-            return;
-        }
-        boolean any = liveTvIntent() != null || !sourcePanelService.isEmpty()
-                || (coocaaSources && !CoocaaSources.list(this).isEmpty());
+        boolean any = liveTvIntent() != null || !sourcePanelService.isEmpty() || xiaomiExternalSource();
         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
         if (!any && tim != null) {
             for (TvInputInfo info : tim.getTvInputList()) {
                 // Inputs hidden in Settings > Inputs are left out of the menu, so they don't count here either.
-                if (info.isPassthroughInput() && !info.isHidden(this)) {
+                if (info.isPassthroughInput() && !inputHidden(info)) {
                     any = true;
                     break;
                 }
@@ -3390,6 +3561,39 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         return component != null ? new Intent().setComponent(component) : new Intent(inputAction);
     }
 
+    /** Xiaomi's player switches HDMI and AV with an integer extra. The standard channel URI has no handler. */
+    private boolean xiaomiExternalSource() {
+        return getPackageManager().resolveActivity(new Intent().setClassName(
+                "com.xiaomi.mitv.tvplayer", "com.xiaomi.mitv.tvplayer.ExternalSourceActivity"), 0) != null;
+    }
+
+    /** HDMI 1–3 are 23–25 and the composite AV input is 2, read by ExternalSourceActivity as extra "input". */
+    private void addXiaomiSourceRows(LinearLayout rows, PopupWindow popup) {
+        int[] sources = {23, 24, 25, 2};
+        String[] labels = {"HDMI 1", "HDMI 2", "HDMI 3", "AV"};
+        String[] services = {"Hdmi1InputService", "Hdmi2InputService", "Hdmi3InputService", "AV1InputService"};
+        for (int i = 0; i < sources.length; i++) {
+            final int source = sources[i];
+            addInputRow(rows, popup, i == 3 ? R.drawable.ic_av : R.drawable.ic_input, labels[i],
+                    xiaomiInputState(services[i]), () -> openXiaomiSource(source));
+        }
+    }
+
+    private int xiaomiInputState(String service) {
+        TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
+        if (tim == null) return -1;
+        for (TvInputInfo info : tim.getTvInputList()) {
+            if (info.getId() != null && info.getId().contains(service)) return tim.getInputState(info.getId());
+        }
+        return -1;
+    }
+
+    private void openXiaomiSource(int source) {
+        open(new Intent("com.xiaomi.mitv.tvplayer.EXTSRC_PLAY")
+                .setClassName("com.xiaomi.mitv.tvplayer", "com.xiaomi.mitv.tvplayer.ExternalSourceActivity")
+                .putExtra("input", source));
+    }
+
     /** Dropdown menu under the Inputs pill: HDMI ports (with connection state), AV and Live TV. */
     private void showInputs() {
         // A configured source panel and no Live TV row to offer next to it: the panel is the whole menu.
@@ -3412,6 +3616,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         final PopupWindow popup = glassPopup(panel, width);
 
         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
+        if (xiaomiExternalSource()) addXiaomiSourceRows(rows, popup);
         // inputs_connected_only: ports without a connected device and the AV jacks fold behind a "More inputs" row.
         boolean connectedOnly = inputsConnectedOnly;
         List<View> folded = new ArrayList<>();
@@ -3421,7 +3626,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         String tunerId = null;
         boolean tunerIsHw = false;
         boolean tunerIsAnalog = false;
-        if (tim != null) {
+        if (tim != null && rows.getChildCount() == 0) {
             List<TvInputInfo> inputs = new ArrayList<>(tim.getTvInputList());
             // HDMI ports first in port order, then AV and the rest.
             Collections.sort(inputs, (a, b) -> {
@@ -3439,7 +3644,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             for (TvInputInfo info : inputs) {
                 String parent = info.getParentId();
                 if (parent == null || !inputIds.contains(parent)) continue;
-                if (!info.isPassthroughInput() || info.isHidden(this)) continue;
+                if (!info.isPassthroughInput() || inputHidden(info)) continue;
                 List<TvInputInfo> onPort = cecDevices.get(parent);
                 if (onPort == null) cecDevices.put(parent, onPort = new ArrayList<>());
                 onPort.add(info);
@@ -3479,16 +3684,14 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     }
                 }
                 // Inputs hidden in the TV's Settings > Inputs stay out of the menu too.
-                if (!info.isPassthroughInput() || info.isHidden(this)) continue;
-                // input_sources can leave out ports the board reports but the set does not have ("HW8=-").
-                if (Integer.valueOf(-1).equals(mappedSource(info.getId()))) continue;
+                if (!info.isPassthroughInput() || inputHidden(info)) continue;
                 // A CEC device's row is added with its port, below.
                 if (info.getParentId() != null && inputIds.contains(info.getParentId())) continue;
                 CharSequence l = info.loadLabel(this);
                 String label = l == null ? info.getId() : l.toString();
                 boolean hdmi = info.getType() == TvInputInfo.TYPE_HDMI;
                 if (hdmi && !label.toUpperCase(Locale.ROOT).contains("HDMI")) label = "HDMI " + label;
-                CharSequence custom = InputNames.tidy(info.loadCustomLabel(this));
+                CharSequence custom = InputNames.tidy(customLabel(info));
                 boolean named = custom != null && custom.length() > 0 && !custom.toString().equals(label);
                 if (!hdmi && rows.getChildCount() > 0 && !sawNonHdmi) {
                     View line = addSeparator(rows);
@@ -3501,7 +3704,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     // Settings > Inputs), then the port. Opening the device's input also makes it the CEC
                     // active source, which wakes it.
                     for (TvInputInfo device : devices) {
-                        CharSequence name = InputNames.tidy(device.loadCustomLabel(this));
+                        CharSequence name = InputNames.tidy(customLabel(device));
                         if (name == null || name.length() == 0) name = named ? custom : device.loadLabel(this);
                         String deviceLabel = name == null || name.length() == 0 ? label : name + " \u00B7 " + label;
                         final String deviceId = device.getId();
