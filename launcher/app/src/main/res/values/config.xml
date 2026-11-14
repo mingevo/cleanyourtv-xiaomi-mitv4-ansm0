@@ -16,11 +16,14 @@
     </string-array>
 
     <!-- Apps pinned to the dock row at the bottom, in this order. Missing apps are skipped. -->
+    <!-- Pinned on this TV: the stock defaults (com.xiaomi.smarthome.tv, com.xiaodianshi.tv.yst) are not
+         installed here, so fill_dock used to take the first grid apps and the dock changed whenever the
+         grid order drifted. -->
     <string-array name="dock_apps">
-        <item>com.netflix.ninja</item>
-        <item>com.amazon.amazonvideo.livingroom</item>
-        <item>com.google.android.youtube.tv</item>
-        <item>in.startv.hotstar</item>
+        <item>com.analiti.fastest.android</item>
+        <item>org.xbmc.kodi</item>
+        <item>com.mixplorer.silver</item>
+        <item>com.xiaomi.mitv.settings</item>
     </string-array>
     <!-- With fewer dock_apps than columns (or a dock app that is not installed), the free dock slots take
          the first grid apps, so the dock never shows a gap. false leaves them empty (#162); a theme can
@@ -31,6 +34,14 @@
     <string-array name="hidden_apps">
         <item>com.mediatek.wwtv.tvcenter</item>
         <item>com.mitv.gallery</item>
+        <item>com.xiaomi.mitv.appstore</item>
+        <item>com.xiaomi.mitv.tvmanager</item>
+        <item>com.mitv.alarmcenter</item>
+        <item>com.xiaomi.mitv.smartshare</item>
+        <item>com.duokan.airkan.tvbox</item>
+        <item>com.mi.miplay.mitvupnpsink</item>
+        <item>com.xiaomi.upnp</item>
+        <item>com.xiaomi.miplay</item>
     </string-array>
 
     <!-- The TV's Live TV / tuner app, offered at the end of the Inputs menu. Leave empty to omit. -->
@@ -118,7 +129,10 @@
          own source picker instead, started by itself for every row, ahead of the standard way: for firmware that
          answers the channel URI with "unsupported" (Redmi X65, MiTV-NSOP0:
          com.xiaomi.mitv.tvplayer/.ExternalSourceActivity opens its HDMI 1 / HDMI 2 / AV overlay). Leave empty to omit. -->
-    <string name="input_action" translatable="false"></string>
+    <!-- MiTV4-ANSM0: the channel URI has no handler here, so the Inputs button sends this action with the same
+         URI. The app library's own HDMI rows do not go through this: they launch the activity with the input
+         port as an int extra (see input_sources). -->
+    <string name="input_action" translatable="false">com.xiaomi.mitv.tvplayer.EXTSRC_PLAY</string>
     <!-- Inputs menu: a scheme to send the input's passthrough URI with instead of content:// (and no channel MIME
          type). YaOS: live-tv. Its source player answers live-tv://android.media.tv/passthrough/<input>, while the
          content:// URI goes to its channel player, which resumes the last film it played. Leave empty to omit. -->
@@ -162,8 +176,23 @@
          number as the int extra "input"; "HW<n>=-" leaves a port the board reports but the set does not have
          out of the menu. A theme can set the same list. Xiaomi/Redmi China firmware (MiTV-MFTP0) needs input_action
          com.xiaomi.mitv.tvplayer.EXTSRC_PLAY and MStar numbers: HW5=23, HW6=24, HW7=25, HW8=-, HW2=2,
-         HW3=-, HW4=- (see examples/redmi-mitv-mftp0). Leave empty to omit. -->
+         HW3=-, HW4=- (see examples/redmi-mitv-mftp0). Leave empty to omit.
+         MiTV4-ANSM0 (this set) reports its ports in the reverse order: Hdmi1InputService is the jack
+         labelled HDMI 3 and Hdmi3InputService the one labelled HDMI 1, while tvplayer's numbers still
+         follow the panel (23 = HDMI 1). Hence HW7=23 and HW5=25 here, verified against tv_input while a
+         device sat on HDMI 3. -->
     <string-array name="input_sources" translatable="false">
+        <item>HW7=23</item>
+        <item>HW6=24</item>
+        <item>HW5=25</item>
+    </string-array>
+
+    <!-- HDMI / AV rows shown in the App library, "label:source number" (the same numbers `input_sources` uses,
+         sent as the int extra "input" of `input_action`). Leave empty to omit. -->
+    <string-array name="library_inputs" translatable="false">
+        <item>HDMI 1:23</item>
+        <item>HDMI 2:24</item>
+        <item>HDMI 3:25</item>
     </string-array>
 
     <!-- Remote buttons that open Settings, by Linux scancode (HOME_KEY_SERVICE=1 build-and-install.sh). Remotes
@@ -248,7 +277,7 @@
          com.xgimi.xrmservice does, on every one of its remote keys, power included (docs/TROUBLESHOOTING.md).
          Whenever that launcher's home screen comes up anyway, HomeKeyService (HOME_KEY_SERVICE=1) sends the TV
          straight back here. A theme's config.json can set it too. Leave empty to omit. -->
-    <string name="stock_home_redirect" translatable="false"></string>
+    <string name="stock_home_redirect" translatable="false">com.mitv.tvhome</string>
 
     <!-- For TVs whose firmware opens the Live TV app (live_tv_package) by itself at every power-on, with no setting
          to change it (Changhong / Homwee boards start com.mediatek.wwtv.tvcenter from its own boot receiver, which
@@ -356,11 +385,12 @@
          of white for both. Can also be set with "wifi_status_warnings": true in a theme's config.json. -->
     <bool name="wifi_status_warnings">false</bool>
     <!-- The app library as a round button in the top bar, beside Settings (app_library must be on too). -->
-    <bool name="library_button">false</bool>
+    <bool name="library_button">true</bool>
     <!-- The App library pill after the last Home row. false hides it while library_button is on, so the top-bar
          button stays the way in, and Down from the last row stays put as with app_library off. Can also be set
          with "show_library_pill": false in a theme's config.json. -->
-    <bool name="show_library_pill">true</bool>
+    <!-- MiTV4-ANSM0 keeps the top-bar button as the only way in (the verified layout), so no pill. -->
+    <bool name="show_library_pill">false</bool>
     <!-- With icon_only_buttons: keep the network name on the Wi-Fi pill up to this width in dp, cut with an ellipsis.
          0 leaves the Wi-Fi pill as an icon. -->
     <integer name="wifi_label_width">0</integer>
@@ -429,7 +459,7 @@
     <bool name="show_home_settings_shortcut">false</bool>
 
     <!-- Installed launchable apps, including ordinary Android apps. Also settable in config.json. -->
-    <bool name="app_library">false</bool>
+    <bool name="app_library">true</bool>
     <!-- Every app tile is its icon on a card tinted from that icon, name only under the focused tile,
          instead of each app's own banner. Off by default; a theme can set "uniform_tiles": true. -->
     <bool name="uniform_tiles">false</bool>
@@ -447,6 +477,15 @@
          (many China-market TVs, e.g. Coocaa 8R145), a fresh Home with app_library on would otherwise be
          nearly empty. Empty (off) by default, so existing setups change nothing. -->
     <string-array name="library_apps" translatable="false">
+    </string-array>
+    <!-- Always shown in the App library even when the app has no LAUNCHER / LEANBACK_LAUNCHER entry. -->
+    <string-array name="library_catalog" translatable="false">
+        <item>com.xiaomi.mitv.appstore</item>
+    </string-array>
+    <!-- Never listed in the App library, even with a launcher entry.
+         com.mitv.tvhome was removed from this list on purpose: the App library is the only way to reach the
+         stock PatchWall launcher once HomeKeyService redirects Home, so it must be listed there. -->
+    <string-array name="library_exclude" translatable="false">
     </string-array>
 
     <!-- Packages the App library catalogue never offers, even with app_library on (config.xml

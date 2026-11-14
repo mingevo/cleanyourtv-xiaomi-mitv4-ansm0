@@ -2,6 +2,8 @@ package com.gathin.tvhome;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStatsManager;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -70,7 +72,7 @@ public class HomeKeyService extends AccessibilityService {
     private BroadcastReceiver unlockReceiver;
     /** The stock launcher's HOME activities (stock_home_redirect), disabled ones included. */
     private final Set<String> stockHome = new HashSet<>();
-    /** stock_home_redirect, the stock launcher's package. */
+    /** Package named by stock_home_redirect, so the usage poll can look it up again after it returns. */
     private String stockHomePackage = "";
     /** power_on_home: the Live TV package to send back to Home, empty when off; armed until this uptime or a key. */
     private String powerOnLiveTv = "";
@@ -92,20 +94,75 @@ public class HomeKeyService extends AccessibilityService {
     private boolean steppingOut;
     /** The bound helper, so the opt-in broadcast can arm it without waiting for a new connection. */
     static HomeKeyService running;
+    /** Android 6: PatchWall sends no window event, so usage stats are polled once a second. */
+    private boolean foregroundPollStarted;
+    private boolean foregroundPollStopped;
+    private int foregroundTicks;
+    private static final long FOREGROUND_POLL_MS = 1000;
+    private static final long FOREGROUND_LOOKBACK_MS = 10_000;
+    /** Uptime window power_on_home counts as "at power-on". bootTakeover() uses the bind instead: this set reports
+     *  no boot counter, so an uptime-based test cannot tell a reboot from a wake. */
+    private static final long BOOT_WINDOW_MS = 60_000L;
+    /**
+     * Set when a tile for stock_home_redirect is tapped: the stock launcher was opened on purpose, so Home stays
+     * out of the way until the user leaves it. There is no time limit — the owner works inside PatchWall. It is
+     * cleared as soon as any other activity comes to the front, or when this launcher is resumed again.
+     */
+    static volatile boolean stockHomePassthrough;
+    /** When the stock launcher was opened on purpose; its own entry is ignored below this point plus a margin. */
+    private static volatile long stockHomeEnteredAt;
+    /** When the task switcher was put up from the long press, so its own resume is not read as a Home press. */
+    private static volatile long recentsShownAt;
+
+    static void enterStockHome() {
+        stockHomePassthrough = true;
+        stockHomeEnteredAt = System.currentTimeMillis();
+    }
+
+    /**
+     * Ends the pass-through. Ignored while the entry is still in flight: bringing the stock launcher up resumes
+     * this launcher for a moment on the way, and that must not be read as the owner coming back.
+     */
+    static void leaveStockHome() {
+        if (System.currentTimeMillis() - stockHomeEnteredAt < ENTRY_GRACE_MS) return;
+        stockHomePassthrough = false;
+    }
+
+    /** How long after the entry a resume of this launcher still counts as part of the entry itself. */
+    private static final long ENTRY_GRACE_MS = 2500;
+
+    /** The bound service instance, so a tile can ask Android to deliver HOME without starting a guarded activity. */
+    private static volatile HomeKeyService live;
+
+    /**
+     * Brings the stock launcher to the front the way the remote does. performGlobalAction(HOME) is the system
+     * delivering the key itself, so the firmware hands it to whichever process it treats as home (PatchWall)
+     * without needing com.mitv.tvhome.permission.HOME_STATE, which only the firmware holds and which blocks any
+     * explicit start of its launcher activity. Returns false when the service is not bound, so callers can fall
+     * back to an explicit intent.
+     */
+    static boolean goToStockHome() {
+        HomeKeyService service = live;
+        if (service == null) return false;
+        service.performGlobalAction(GLOBAL_ACTION_HOME);
+        return true;
+    }
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         running = this;
+        live = this;
+        watchHomeKey();
         settingsScancodes = getResources().getIntArray(R.array.settings_key_scancodes);
         // The service is directBootAware: Android 11 skips a service that is not while the user is still
         // locked at boot, writes accessibility_enabled=0 and, on TCL G03 firmware, never binds it after the
         // unlock. Config.load reads credential-protected storage, so wait for the unlock before reading it.
-        UserManager users = getSystemService(UserManager.class);
-        if (users.isUserUnlocked()) {
+        if (userUnlocked()) {
             loadConfig();
             return;
         }
+        UserManager users = getSystemService(UserManager.class);
         unlockReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
@@ -115,10 +172,17 @@ public class HomeKeyService extends AccessibilityService {
         };
         registerReceiver(unlockReceiver, new IntentFilter(Intent.ACTION_USER_UNLOCKED));
         // The unlock may have happened between the check and the registration.
-        if (users.isUserUnlocked()) {
+        if (userUnlocked()) {
             stopWaitingForUnlock();
             loadConfig();
         }
+    }
+
+    /** Android 6 has no direct-boot lock. isUserUnlocked is Android 7. */
+    private boolean userUnlocked() {
+        if (android.os.Build.VERSION.SDK_INT < 24) return true;
+        UserManager users = getSystemService(UserManager.class);
+        return users == null || users.isUserUnlocked();
     }
 
     private void stopWaitingForUnlock() {
@@ -138,9 +202,13 @@ public class HomeKeyService extends AccessibilityService {
     @Override
     public void onDestroy() {
         if (running == this) running = null;
+        if (live == this) live = null;
         RemoteKeys.frontPackage = "";
         RemoteKeys.release(this);
         stopWaitingForUnlock();
+        stopWatchingHomeKey();
+        foregroundPollStopped = true;
+        handler.removeCallbacks(foregroundCheck);
         if (screenOnReceiver != null) unregisterReceiver(screenOnReceiver);
         if (standbyExit != null) {
             try {
@@ -152,6 +220,56 @@ public class HomeKeyService extends AccessibilityService {
         if (gamepads != null) gamepads.stop();
         if (consumeVolumeKeys) VolumeKeys.stop();
         super.onDestroy();
+    }
+
+    /**
+     * The window manager closes system dialogs on every Home press with reason "homekey", and this firmware hands
+     * the key itself to the front window instead of letting the accessibility filter see it. That broadcast is the
+     * only signal that survives inside the stock launcher, whose own Home press does not even produce a usage
+     * event because it is already the foreground activity. Guarded by the pass-through and delayed, so a long press
+     * that brings up the task switcher is not mistaken for a short one.
+     */
+    private BroadcastReceiver watcher;
+    private static final long HOMEKEY_SETTLE_MS = 800;
+
+    private final Runnable homekeyCheck = new Runnable() {
+        @Override
+        public void run() {
+            // The entry itself is performed with a HOME action, which raises the same broadcast: skip that one.
+            if (System.currentTimeMillis() - stockHomeEnteredAt < ENTRY_GRACE_MS) return;
+            // A long press raises "recentapps" and is filtered out in the watcher, but the firmware also closes
+            // system dialogs with "homekey" when its own panel is up: leave the task switcher alone.
+            if (System.currentTimeMillis() - recentsShownAt < 3000) return;
+            // A short Home press. Nothing else produces this reason, so it means "back to this launcher" wherever
+            // the key was pressed — inside PatchWall, inside an app PatchWall opened, in an input, in this launcher.
+            // No front-activity test here: the usage record lags by a second or two, and testing it let a Home
+            // press in another app fall through and leave the owner on PatchWall.
+            stockHomePassthrough = false;
+            openHome();
+        }
+    };
+
+    private void watchHomeKey() {
+        if (watcher != null) return;
+        watcher = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String reason = intent.getStringExtra("reason");
+                if (!"homekey".equals(reason)) return;
+                // Not guarded by the pass-through: the firmware also routes a Home press made in another app
+                // straight to PatchWall, and that press has to come back here too.
+                handler.removeCallbacks(homekeyCheck);
+                handler.postDelayed(homekeyCheck, HOMEKEY_SETTLE_MS);
+            }
+        };
+        registerReceiver(watcher, new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS));
+    }
+
+    private void stopWatchingHomeKey() {
+        if (watcher == null) return;
+        unregisterReceiver(watcher);
+        watcher = null;
+        handler.removeCallbacks(homekeyCheck);
     }
 
     /** Some TCL boards never wake from the remote while this helper stays bound with the screen off. */
@@ -225,11 +343,21 @@ public class HomeKeyService extends AccessibilityService {
         }
         // home_key_service.xml subscribes to no events, so the redirects ask for window changes only when one is on.
         AccessibilityServiceInfo info = getServiceInfo();
-        if (info != null && (!stockHome.isEmpty() || !powerOnLiveTv.isEmpty() || watchFront)) {
+        // Window changes: stock home coming back, and this TV's long-press Home, which the firmware
+        // handles itself (CloudEntryActivity) before the key ever reaches this filter.
+        if (info != null) {
             info.eventTypes |= AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
             setServiceInfo(info);
         }
-        if (!stockHome.isEmpty() || !powerOnLiveTv.isEmpty()) probeAtBoot();
+        if (!stockHome.isEmpty()) bootTakeover();
+        // MiTV4-ANSM0 (Android 6): the stock home comes up without an accessibility window event.
+        // Usage stats still name the activity in front. Without the permission the poll stops itself.
+        if (Build.VERSION.SDK_INT <= 23 && !foregroundPollStarted) {
+            foregroundPollStarted = true;
+            handler.postDelayed(foregroundCheck, FOREGROUND_POLL_MS);
+        }
+        // Upstream's probeAtBoot() here is dropped on purpose: it counts boots with Settings.Global BOOT_COUNT,
+        // which this set answers with null, so it would never fire. bootTakeover() above counts from the bind.
         armStandbyExit();
         holdAppKeys = RemoteKeys.parseHoldAppKeys(config.appKeys);
         holdAppScancodes = RemoteKeys.parseHoldAppScancodes(config.appKeys);
@@ -297,12 +425,21 @@ public class HomeKeyService extends AccessibilityService {
             if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) openHome();
             return true;
         }
-        if (event.getKeyCode() == KeyEvent.KEYCODE_HOME && !stockHome.isEmpty()) {
-            redirectHomeKey(event);
-            return false;
+        int code = event.getKeyCode();
+        // Consume Home. Returning it to this firmware starts 云服务同步 on a long press, because the
+        // stock launcher that used to open all apps is gone. A short press opens Home; a long press
+        // opens the app library (the same list as 我的应用).
+        if (code != KeyEvent.KEYCODE_HOME && code != KeyEvent.KEYCODE_ALL_APPS) return false;
+        if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
+            if (isShortPress(event.getDownTime(), event.getEventTime(), ViewConfiguration.getLongPressTimeout())) {
+                // An explicit press of Home always means "back to this launcher", even from the stock one.
+                leaveStockHome();
+                openHome();
+            } else {
+                // Long press: the task switcher, where the running apps can be seen and cleared.
+                performGlobalAction(GLOBAL_ACTION_RECENTS);
+            }
         }
-        if (event.getKeyCode() != KeyEvent.KEYCODE_ALL_APPS) return false;
-        if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) openHome();
         return true;
     }
 
@@ -333,9 +470,34 @@ public class HomeKeyService extends AccessibilityService {
             openHome();
             return;
         }
-        // stock_home_redirect: the firmware turned the stock launcher back on and its home screen came up.
         CharSequence cls = event.getClassName();
-        if (!stockHome.isEmpty() && cls != null && stockHome.contains(cls.toString())) openHome();
+        if (cls == null) return;
+        String name = cls.toString();
+        // Long-press Home on this firmware opens Xiaomi cloud sync instead of a task switcher. Turn that screen
+        // into the task switcher the owner asked for: it lists the running apps and can clear them all.
+        if (name.endsWith("CloudEntryActivity")) {
+            recentsShownAt = System.currentTimeMillis();
+            // The task switcher is now the front surface, so Home takes over again once it is dismissed.
+            leaveStockHome();
+            performGlobalAction(GLOBAL_ACTION_RECENTS);
+            return;
+        }
+        // stock_home_redirect: while the stock launcher was opened on purpose, leave it alone. Another app (or a
+        // system panel such as the task switcher) coming to the front means the owner has moved on, so Home
+        // takes over again from there.
+        if (stockHomePassthrough) {
+            CharSequence from = event.getPackageName();
+            String pkg = from == null ? "" : from.toString();
+            if (!pkg.isEmpty() && !pkg.equals(stockHomePackage) && !pkg.equals(getPackageName())
+                    && !pkg.equals("android") && !pkg.startsWith("com.android.systemui")) {
+                stockHomePassthrough = false;
+            }
+            return;
+        }
+        // No "stock home came to the front, so send the owner back" here. PatchWall reaches the front for reasons
+        // that are not Home: Back out of a page it opened, Back out of 相册 / 电视管家, and the long press that
+        // raises the task switcher. Redirecting on those threw the owner out of every one of them. Home is
+        // recognised only by its own "homekey" broadcast, in homekeyCheck.
     }
 
     /** How long power_on_home stays armed after the screen turns on without a reboot. */
@@ -385,42 +547,107 @@ public class HomeKeyService extends AccessibilityService {
         return !liveTv.isEmpty() && pkg != null && liveTv.contentEquals(pkg) && now < armedUntil;
     }
 
-    /** How long after boot the first bind still counts as "at boot" for probeAtBoot. */
-    static final long BOOT_WINDOW_MS = 3 * 60 * 1000L;
+    /** How long after the bind the boot takeover keeps looking for the firmware home screen. The bind itself is
+     *  the "boot finished" signal, so counting from it is steadier than counting from uptime (this TV reports no
+     *  boot counter at all), and the window still covers a slow start-up. */
+    private static final long BOOT_WATCH_MS = 90 * 1000L;
 
-    /** stock_home_redirect at boot: the stock home is often on screen before Android binds this service, so no
-     *  window event for it arrives (#1116). Once per boot, open ProbeActivity: when it closes, whatever was in
-     *  front comes back and sends a window event, and onAccessibilityEvent covers it only if it is the stock home.
-     *  An HDMI input or an app that the TV resumed at boot is left alone. */
-    private void probeAtBoot() {
-        int boot = Settings.Global.getInt(getContentResolver(), Settings.Global.BOOT_COUNT, -1);
-        SharedPreferences prefs = getSharedPreferences("boot", MODE_PRIVATE);
-        if (!firstBindAfterBoot(boot, prefs.getInt("probe_boot", -1), SystemClock.elapsedRealtime())) return;
-        prefs.edit().putInt("probe_boot", boot).apply();
-        try {
-            startActivity(new Intent(this, ProbeActivity.class)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
-        } catch (ActivityNotFoundException | SecurityException ignored) {
+    private long bootWatchUntil;
+    private boolean bootChecked;
+
+    /** This TV's own home screen is the system home process (`mHomeProcess: com.mitv.tvhome`, run as uid 1000 by
+     *  the firmware), so a restart lands on PatchWall with nobody having pressed Home. Nothing redirects that
+     *  screen, which is why a reboot used to stay there. From the bind on, for the next minute and a half, the
+     *  one-second poll below takes the first chance to bring this launcher forward — but only when what is in
+     *  front really is PatchWall: an HDMI input, or an app the TV resumed by itself at boot, is left alone. */
+    private void bootTakeover() {
+        bootChecked = false;
+        bootWatchUntil = SystemClock.elapsedRealtime() + BOOT_WATCH_MS;
+    }
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+
+    /** One look per second at which activity moved to the front. Stops after a missing permission. */
+    private final Runnable foregroundCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (foregroundPollStopped) return;
+            handler.postDelayed(this, FOREGROUND_POLL_MS);
+            foregroundTicks++;
+            if (stockHome.isEmpty() || foregroundTicks % 30 == 1) refreshStockHomes();
+            if (stockHome.isEmpty()) return;
+            long[] at = new long[1];
+            String cls = newestForeground(at);
+            if (!bootChecked && SystemClock.elapsedRealtime() < bootWatchUntil) {
+                // Boot takeover, see bootTakeover. Any other screen in front means the TV was left on an input or
+                // on an app, so the owner is where they meant to be.
+                if (cls != null && isStockLauncher(cls)) {
+                    bootChecked = true;
+                    android.util.Log.i("TvHomeBoot", "takeover front=" + cls);
+                    stockHomePassthrough = false;
+                    openHome();
+                }
+                return;
+            }
+            if (stockHomePassthrough) {
+                // Stay as long as the owner is anywhere inside PatchWall: its home screen, or any page opened from
+                // there (details, 我的应用, …). Those pages are the same package under another class name, so the
+                // test has to be by package.
+                if (cls == null || isStockLauncher(cls)) return;
+                stockHomePassthrough = false;
+            }
+            // Nothing else here opens this launcher. PatchWall coming back to the front is not a Home press: it is
+            // what Back from a page it opened (a detail screen, 相册, 电视管家) does, and what the long press that
+            // shows the task switcher does. Treating it as Home bounced the owner out of both. The Home key itself
+            // is recognised by its own broadcast, in homekeyCheck, on a short press only.
+        }
+    };
+
+    private void refreshStockHomes() {
+        String pkg = stockHomePackage;
+        if (pkg == null || pkg.isEmpty()) return;
+        stockHome.clear();
+        Intent home = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).setPackage(pkg);
+        for (ResolveInfo ri : getPackageManager().queryIntentActivities(home, PackageManager.MATCH_DISABLED_COMPONENTS)) {
+            stockHome.add(ri.activityInfo.name);
         }
     }
 
-    static boolean firstBindAfterBoot(int boot, int lastBoot, long uptimeMs) {
-        return boot >= 0 && boot != lastBoot && uptimeMs < BOOT_WINDOW_MS;
+    /**
+     * True when this activity class belongs to the stock launcher: its Home activity itself, or any page it opens
+     * from there (details, 我的应用, …). Those pages are the same package under other class names, so the package
+     * prefix is what keeps a page change from reading as "the owner left PatchWall". Matched against the package
+     * seen in the usage event, never against a hard-coded class list, which would go stale on the next firmware.
+     */
+    private boolean isStockLauncher(String cls) {
+        if (cls == null || cls.isEmpty()) return false;
+        if (stockHome.contains(cls)) return true;
+        return !stockHomePackage.isEmpty() && cls.startsWith(stockHomePackage + ".");
     }
 
-    /** Lets the system see the key, so a long press still does what the firmware gives it. */
-    private static final long HOME_KEY_DELAY_MS = 250;
-    private final Handler handler = new Handler(Looper.getMainLooper());
-
-    /** stock_home_redirect on the Home key: when the stock home is already on screen (it came up at boot, before
-     *  Android bound this service), Home brings it up again with no window change, so the redirect above never
-     *  fires and the TV stays on the stock home until another app opens (#1116). A short press opens this
-     *  launcher shortly after the system has handled the key; a long press (Google TV's quick settings) is left
-     *  alone. Held time, not repeats: key repeats are made after accessibility filtering, so none arrive here. */
-    private void redirectHomeKey(KeyEvent event) {
-        if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()
-                && isShortPress(event.getDownTime(), event.getEventTime(), ViewConfiguration.getLongPressTimeout())) {
-            handler.postDelayed(this::openHome, HOME_KEY_DELAY_MS);
+    /** Class name of the newest move to the front in the last few seconds, or null. */
+    private String newestForeground(long[] atOut) {
+        UsageStatsManager stats = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
+        if (stats == null) return null;
+        try {
+            long now = System.currentTimeMillis();
+            UsageEvents events = stats.queryEvents(now - FOREGROUND_LOOKBACK_MS, now);
+            if (events == null) return null;
+            UsageEvents.Event event = new UsageEvents.Event();
+            String cls = null;
+            long at = 0;
+            while (events.hasNextEvent()) {
+                events.getNextEvent(event);
+                if (event.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND && event.getClassName() != null) {
+                    cls = event.getClassName();
+                    at = event.getTimeStamp();
+                }
+            }
+            atOut[0] = at;
+            return cls;
+        } catch (SecurityException denied) {
+            foregroundPollStopped = true;
+            return null;
         }
     }
 
@@ -429,10 +656,18 @@ public class HomeKeyService extends AccessibilityService {
     }
 
     private void openHome() {
+        if (stockHomePassthrough) return;
         Intent open = stockHomeStays() ? new Intent(this, MainActivity.class)
                 : new Intent(Intent.ACTION_MAIN).setPackage(getPackageName());
         startActivity(open.addCategory(Intent.CATEGORY_HOME)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED));
+    }
+
+    /** Long-press Home: the full app list, including apps that are not on the desktop. */
+    private void openLibrary() {
+        startActivity(new Intent(this, MainActivity.class)
+                .putExtra(MainActivity.EXTRA_OPEN_LIBRARY, true)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP));
     }
 
     /** stock_home_redirect while Android's Home is still the stock launcher (launcherx on Google TV outranks this

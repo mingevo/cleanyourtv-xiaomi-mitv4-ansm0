@@ -53,7 +53,13 @@ final class Order {
     }
 
     static String dockKey(List<String> dockApps) {
-        return String.join(",", dockApps);
+        // String.join is Android 8.1; joining by hand keeps the dock key working on API 23.
+        StringBuilder sb = new StringBuilder();
+        for (String app : dockApps) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(app);
+        }
+        return sb.toString();
     }
 
     static String encode(Order order) {

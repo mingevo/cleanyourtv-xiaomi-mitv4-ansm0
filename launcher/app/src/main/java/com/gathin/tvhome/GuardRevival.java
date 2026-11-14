@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.Build;
 import android.os.UserManager;
 import android.service.notification.NotificationListenerService;
 
@@ -19,22 +20,26 @@ public class GuardRevival extends NotificationListenerService {
 
     @Override
     public void onListenerConnected() {
-        UserManager users = getSystemService(UserManager.class);
-        if (users != null && !users.isUserUnlocked()) {
-            if (unlocked != null) return;
-            unlocked = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
+        // Android 6 has no direct-boot lock, and isUserUnlocked() does not exist there at all
+        // (NoSuchMethodError, which would kill this listener before it can revive the helper).
+        if (Build.VERSION.SDK_INT >= 24) {
+            UserManager users = getSystemService(UserManager.class);
+            if (users != null && !users.isUserUnlocked()) {
+                if (unlocked != null) return;
+                unlocked = new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        stopWaiting();
+                        GuardKeep.ensureHomeKey(GuardRevival.this);
+                    }
+                };
+                registerReceiver(unlocked, new IntentFilter(Intent.ACTION_USER_UNLOCKED));
+                if (users.isUserUnlocked()) {
                     stopWaiting();
-                    GuardKeep.ensureHomeKey(GuardRevival.this);
+                    GuardKeep.ensureHomeKey(this);
                 }
-            };
-            registerReceiver(unlocked, new IntentFilter(Intent.ACTION_USER_UNLOCKED));
-            if (users.isUserUnlocked()) {
-                stopWaiting();
-                GuardKeep.ensureHomeKey(this);
+                return;
             }
-            return;
         }
         GuardKeep.ensureHomeKey(this);
     }

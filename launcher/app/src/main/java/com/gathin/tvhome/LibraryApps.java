@@ -20,6 +20,20 @@ import java.util.function.IntPredicate;
 /** Home shortcut choices made from the library, separate from theme defaults and tile ordering. */
 final class LibraryApps {
     static final int MAX_ADDED = 128;
+    /** The library's virtual rows: "input:23" is HDMI 1 on this firmware. Saved like an app so it can be pinned. */
+    static final String INPUT_PREFIX = "input:";
+
+    /** The vendor source number in an "input:NN" key, or -1 when this is not one. */
+    static int inputSource(String pkg) {
+        if (pkg == null || !pkg.startsWith(INPUT_PREFIX)) return -1;
+        try {
+            int source = Integer.parseInt(pkg.substring(INPUT_PREFIX.length()));
+            return source >= 0 && source <= 999 ? source : -1;
+        } catch (NumberFormatException bad) {
+            return -1;
+        }
+    }
+
     private static final long RECENT_MS = 7L * 24 * 60 * 60 * 1000;
     private static final int MAX_BYTES = MAX_ADDED * 256;
 
@@ -198,6 +212,8 @@ final class LibraryApps {
 
     static boolean validPackage(String pkg) {
         if (pkg == null || pkg.isEmpty() || pkg.length() > 255) return false;
+        // The library's virtual rows (HDMI 1 = "input:23") are saved like an app, so the owner can pin them.
+        if (pkg.startsWith(INPUT_PREFIX)) return inputSource(pkg) >= 0;
         boolean first = true;
         for (int i = 0; i < pkg.length(); i++) {
             char c = pkg.charAt(i);

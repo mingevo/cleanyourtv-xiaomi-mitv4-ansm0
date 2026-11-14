@@ -37,7 +37,7 @@
                 android:format24Hour=""
                 android:textColor="#99FFFFFF"
                 android:textSize="22sp"
-                android:fontFamily="@string/font_medium"
+                style="@style/FontMedium"
                 android:letterSpacing="0.08"
                 android:textAllCaps="true" />
 
@@ -49,7 +49,7 @@
                 android:format24Hour="HH:mm"
                 android:textColor="#E6FFFFFF"
                 android:textSize="120sp"
-                android:fontFamily="@string/font_extralight"
+                style="@style/FontExtraLight"
                 android:letterSpacing="-0.04"
                 android:includeFontPadding="false" />
         </LinearLayout>
@@ -65,7 +65,7 @@
             android:format24Hour="@string/date_format"
             android:textColor="#8CFFFFFF"
             android:textSize="18sp"
-            android:fontFamily="@string/font_regular"
+            style="@style/FontRegular"
             android:letterSpacing="0.14"
             android:textAllCaps="true" />
     </LinearLayout>

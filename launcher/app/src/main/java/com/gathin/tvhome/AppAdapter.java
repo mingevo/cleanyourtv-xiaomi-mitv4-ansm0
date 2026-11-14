@@ -5,6 +5,8 @@ import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
@@ -16,7 +18,6 @@ import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.KeyEvent;
@@ -56,6 +57,9 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         /** Called for a D-pad direction key on a tile. Return true when handled (focus stays put). */
         boolean onTileVerticalKey(int position, int keyCode);
 
+        /** Hold OK on a tile. Return true when the press is consumed. */
+        boolean onTileLongClick(int position, View card);
+
         void onLibraryRequested();
         void onLibraryFocused();
         /** Hold OK on a tile: the activity shows the tile menu (move, remove from Home, app info). */
@@ -66,7 +70,7 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
     }
 
     static final class Entry {
-        static final int APP = 0, HOME_SETTINGS = 1, CARD = 2, EMPTY = 3;
+        static final int APP = 0, HOME_SETTINGS = 1, CARD = 2, EMPTY = 3, INPUT = 4;
 
         final int kind;
         final String label;
@@ -76,6 +80,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         final Drawable icon;
         /** Text under the tile when it is focused in the grid: the label, plus the caption for a card. */
         final String name;
+        /** The vendor source number of an INPUT row (HDMI 1 = 23 on Xiaomi firmware); -1 for every other entry. */
+        final int inputSource;
         /** Ambient glow colour; 0 until sampled from the banner, or the card's accent from the start. */
         int ambient;
         /** uniform_tiles card fill, top and bottom colour; null until sampled from the icon. */
@@ -86,6 +92,11 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         }
 
         Entry(int kind, String label, ComponentName component, Drawable banner, Drawable icon, String caption, int accent) {
+            this(kind, label, component, banner, icon, caption, accent, -1);
+        }
+
+        Entry(int kind, String label, ComponentName component, Drawable banner, Drawable icon, String caption,
+                int accent, int inputSource) {
             this.kind = kind;
             this.label = label;
             this.component = component;
@@ -94,6 +105,7 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             this.icon = icon;
             this.name = caption == null ? label : label + " \u00B7 " + caption;
             this.ambient = accent;
+            this.inputSource = inputSource;
         }
     }
 
@@ -221,6 +233,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
     /** Packages drawn from their icon and name even when they have a banner (config.xml icon_tiles). */
     private final Set<String> iconTiles;
     private final List<Entry> items = new ArrayList<>();
+    /** stock_home_redirect: tapping a tile for this package is opening the stock launcher on purpose. */
+    private final String stockHomePackage;
 
     AppAdapter(Context ctx, TileListener listener, int dockSize, Config cfg) {
         this.ctx = ctx;
@@ -243,6 +257,7 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         this.restNameAlpha = cfg.alwaysShowNames ? 0.75f : 0f;
         this.cinematic = cfg.cinematicHome;
         this.launchActions = cfg.launchActions;
+        this.stockHomePackage = cfg.stockHomeRedirect;
         this.iconTiles = new HashSet<>(Arrays.asList(ctx.getResources().getStringArray(R.array.icon_tiles)));
         this.tileMenu = cfg.tileMenu;
         this.appLabels = cfg.appLabels;
@@ -257,6 +272,65 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
      * Rebuilds the tiles. A shown module card stands in for every tile of its package (same component,
      * so focus follows it); hidden_apps wins over a card, and a card's package in dock_apps takes that slot.
      */
+    /**
+     * A dock_apps package with no TV icon still gets a tile: the store and cast apps on some sets
+     * only publish a phone launcher, or a plain MAIN activity.
+     */
+    private void addFavouriteLaunchers(PackageManager pm, List<ResolveInfo> found, Set<String> tvPackages) {
+        Set<String> have = new HashSet<>();
+        for (ResolveInfo ri : found) if (ri.activityInfo != null) have.add(ri.activityInfo.packageName);
+        for (String pkg : favourites) {
+            if (pkg == null || pkg.isEmpty() || !have.add(pkg)) continue;
+            ResolveInfo ri = launchEntry(pm, pkg);
+            if (ri != null) {
+                found.add(ri);
+                if (pm.getLeanbackLaunchIntentForPackage(pkg) != null) tvPackages.add(pkg);
+            }
+        }
+    }
+
+    /** TV, phone launcher, or Main activity when the app has no LAUNCHER category (e.g. the Mi app store). */
+    static ResolveInfo launchEntry(PackageManager pm, String pkg) {
+        if (pkg == null || pkg.isEmpty()) return null;
+        Intent leanback = pm.getLeanbackLaunchIntentForPackage(pkg);
+        if (leanback != null) {
+            ResolveInfo ri = pm.resolveActivity(leanback, 0);
+            if (ri != null && ri.activityInfo != null) return ri;
+        }
+        Intent launch = pm.getLaunchIntentForPackage(pkg);
+        if (launch != null) {
+            ResolveInfo ri = pm.resolveActivity(launch, 0);
+            if (ri != null && ri.activityInfo != null) return ri;
+        }
+        return mainActivity(pm, pkg);
+    }
+
+    /** The app's Main activity when it publishes no launcher category. */
+    private static ResolveInfo mainActivity(PackageManager pm, String pkg) {
+        try {
+            PackageInfo info = pm.getPackageInfo(pkg, PackageManager.GET_ACTIVITIES);
+            if (info.activities == null) return null;
+            ActivityInfo fallback = null;
+            for (ActivityInfo activity : info.activities) {
+                // Android 6 often leaves ActivityInfo.exported false even when the activity is startable.
+                if (activity.name.endsWith(".MainActivity") || activity.name.endsWith("MainTvManagerActivity")) {
+                    return resolve(activity);
+                }
+                if (fallback == null) fallback = activity;
+            }
+            return fallback == null ? null : resolve(fallback);
+        } catch (PackageManager.NameNotFoundException e) {
+            return null;
+        }
+    }
+
+    private static ResolveInfo resolve(ActivityInfo activity) {
+        activity.exported = true;
+        ResolveInfo ri = new ResolveInfo();
+        ri.activityInfo = activity;
+        return ri;
+    }
+
     void reload(List<Cards.Card> cards, List<ResolveInfo> leanback) {
         PackageManager pm = ctx.getPackageManager();
         // The LEANBACK query is shared with the module-card check (MainActivity); copy it before adding
@@ -265,9 +339,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         Set<String> tvPackages = new HashSet<>();
         for (ResolveInfo ri : found) if (ri.activityInfo != null) tvPackages.add(ri.activityInfo.packageName);
         leanbackPackages = tvPackages;
-        // Copy before merging: LibraryApps.load() may return an immutable empty set (#419).
-        Set<String> added = new HashSet<>(LibraryApps.load(ctx));
-        added.addAll(libraryPreload);
+        addFavouriteLaunchers(pm, found, tvPackages);
+        Set<String> added = LibraryApps.load(ctx);
         Set<String> removed = LibraryApps.loadRemoved(ctx);
         if (!added.isEmpty()) {
             Set<String> seen = new HashSet<>(tvPackages);
@@ -287,7 +360,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             if (ri.activityInfo == null) continue;
             String pkg = ri.activityInfo.packageName;
             if (pkg.equals(ctx.getPackageName()) || !ri.activityInfo.exported
-                    || !LibraryApps.visible(tvPackages.contains(pkg), hidden.contains(pkg), added.contains(pkg), removed.contains(pkg))) continue;
+                    || !LibraryApps.visible(tvPackages.contains(pkg), hidden.contains(pkg),
+                            added.contains(pkg) || favourites.contains(pkg), removed.contains(pkg))) continue;
             ComponentName component = new ComponentName(pkg, ri.activityInfo.name);
             Cards.Card card = cardByPkg.get(pkg);
             if (card != null && !card.component.equals(component)) continue;   // the card stands in for this tile
@@ -326,12 +400,37 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             if (ca != cb) return ca ? -1 : 1;
             return a.label.compareToIgnoreCase(b.label);
         });
+        // HDMI rows the owner pinned from the library. `library_inputs` names the ports ("HDMI 1:23") and
+        // library_apps.txt holds the choice, so these behave exactly like a shortcut to an app.
+        for (String row : ctx.getResources().getStringArray(R.array.library_inputs)) {
+            int colon = row.lastIndexOf(':');
+            if (colon <= 0) continue;
+            int source;
+            try {
+                source = Integer.parseInt(row.substring(colon + 1).trim());
+            } catch (NumberFormatException bad) {
+                continue;
+            }
+            String key = LibraryApps.INPUT_PREFIX + source;
+            if (!added.contains(key)) continue;
+            fresh.add(new Entry(Entry.INPUT, row.substring(0, colon).trim(), new ComponentName(key, "input"),
+                    null, HdmiPorts.icon(ctx, source), null, 0, source));
+        }
         // Retain the optional Default-home tile until dependent tile-ordering work is merged.
         if (showHomeSettings
                 && pm.resolveActivity(new Intent(Settings.ACTION_HOME_SETTINGS), 0) != null) {
             fresh.add(new Entry(Entry.HOME_SETTINGS, ctx.getString(R.string.home_settings),
                     new ComponentName(ctx, HomeSettingsActivity.class), null,
                     ctx.getDrawable(R.drawable.ic_home_settings), null, 0));
+        }
+        // The library rows and the Default-home tile are appended after the app sort above, so the owner's saved
+        // order never reached them: a tile moved with the reorder button fell back to this fixed place at the next
+        // reload, while the pin to Home and the app library said it had moved. Ordering the whole list by the saved
+        // ranks puts every tile back where it was left; tiles without a rank (a new install) keep their relative
+        // order and stay behind the ranked ones.
+        if (!savedRanks.isEmpty()) {
+            Collections.sort(fresh, (a, b) -> Order.compare(savedRanks,
+                    a.component.flattenToShortString(), b.component.flattenToShortString()));
         }
         docked = 0;
         while (docked < fresh.size() && isDocked(fresh.get(docked))) docked++;
@@ -474,7 +573,8 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         }
         h.card.setVisibility(View.VISIBLE);
         h.card.setFocusable(true);
-        h.name.setText(e.name);
+        // An input tile names its port and, while a device answers on it, carries the source panel's green dot.
+        h.name.setText(HdmiPorts.tileName(ctx, e.name, e.inputSource, h.name.getTextSize()));
         // The dock has no labels, unless always_show_names asks for them (DockDecoration then makes room in the band).
         // In a single row every tile is the dock's kind: the big title above names it.
         boolean dockKind = DockSlots.inDockRow(dockRow, singleRow, position, dockSize);
@@ -506,23 +606,13 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             h.banner.setVisibility(View.GONE);
             h.icon.setImageDrawable(e.icon);
             h.icon.setVisibility(View.VISIBLE);
-            h.label.setText(e.label);
+            h.label.setText(HdmiPorts.tileName(ctx, e.label, e.inputSource, h.label.getTextSize()));
             h.label.setVisibility(uniformTiles ? View.GONE : View.VISIBLE);
         }
         h.card.setOnClickListener(v -> launch(e));
         h.card.setOnLongClickListener(v -> {
-            if (tileMenu) {
-                int pos = h.getBindingAdapterPosition();
-                if (pos != RecyclerView.NO_POSITION) listener.onTileLongPress(pos, v);
-                return true;
-            }
-            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + e.pkg));
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            try {
-                ctx.startActivity(i);
-            } catch (ActivityNotFoundException ignored) {
-            }
-            return true;
+            int pos = h.getBindingAdapterPosition();
+            return listener != null && pos != RecyclerView.NO_POSITION && listener.onTileLongClick(pos, v);
         });
     }
 
@@ -532,6 +622,10 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         if (e.kind == Entry.HOME_SETTINGS) {
             ctx.startActivity(new Intent(ctx, HomeSettingsActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            return;
+        }
+        if (e.inputSource >= 0) {
+            openInput(e);
             return;
         }
         Intent i = new Intent(Intent.ACTION_MAIN)
@@ -552,6 +646,21 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             Intent byAction = LaunchActions.intent(e.pkg, action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             if (ctx.getPackageManager().resolveActivity(byAction, 0) != null) i = byAction;
         }
+        // Opening the stock launcher from its tile is a deliberate choice, not Home being hijacked: give the
+        // usage poll a window to leave it alone, or it would bounce straight back here.
+        if (!stockHomePackage.isEmpty() && stockHomePackage.equals(e.pkg)) {
+            HomeKeyService.enterStockHome();
+            // Dispatch HOME from the accessibility service: the firmware routes that key to PatchWall by itself,
+            // which is the only way in — its launcher activity is protected by a signature permission. Fall back
+            // to the unguarded sibling activity when the service is not bound.
+            if (HomeKeyService.goToStockHome()) {
+                if (cinematic) LastOpened.record(ctx, e.pkg);
+                return;
+            }
+            i = new Intent(Intent.ACTION_MAIN)
+                    .setClassName(stockHomePackage, stockHomePackage + ".MainActivity")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        }
         try {
             ctx.startActivity(i);
             if (cinematic) LastOpened.record(ctx, e.pkg);
@@ -563,12 +672,33 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         }
     }
 
+    /** Switches to an HDMI / AV row: the vendor's source player, with its own source number as the extra. */
+    private void openInput(Entry e) {
+        String action = ctx.getString(R.string.input_action);
+        boolean sent = false;
+        if (action != null && !action.isEmpty()) {
+            try {
+                // The source player is singleTask: without CLEAR_TASK a second port only brings the old screen
+                // back to the front, still showing the first port (or nothing at all).
+                ctx.startActivity(new Intent(action).putExtra("input", e.inputSource)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+                sent = true;
+            } catch (ActivityNotFoundException | SecurityException noPlayer) {
+                sent = false;
+            }
+        }
+        if (!sent) Toast.makeText(ctx, ctx.getString(R.string.cant_open, e.label), Toast.LENGTH_SHORT).show();
+    }
+
     @Override
     public int getItemCount() {
         return items.size() + (showLibrary ? 1 : 0);
     }
 
     int appCount() { return items.size(); }
+
+    /** stock_home_redirect, so the app library can treat its tile as "open it" rather than "add it". */
+    String stockHomePackage() { return stockHomePackage; }
 
     boolean isLibraryAt(int position) { return showLibrary && position == items.size(); }
 

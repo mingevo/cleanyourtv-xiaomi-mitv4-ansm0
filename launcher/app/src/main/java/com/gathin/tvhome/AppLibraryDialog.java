@@ -4,11 +4,14 @@ import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.graphics.Typeface;
+import android.os.Build;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -76,6 +79,8 @@ final class AppLibraryDialog {
     private final LibraryLoads loads = new LibraryLoads();
     private final Activity activity;
     private final Predicate<String> onHome;
+    /** stock_home_redirect: this tile opens the stock launcher instead of being added to Home. */
+    private final String stockHomePackage;
     private final Runnable changed;
     private final LinearLayout panel;
     private final boolean reducedMotion;
@@ -83,6 +88,8 @@ final class AppLibraryDialog {
     /** library_ok_opens without app_library_selection: OK opens every app, Add to Home is in the hold menu. */
     private final boolean okOpens;
     private final boolean animations;
+    private final List<String> catalogExtras;
+    private final Set<String> catalogExcluded;
     private final boolean rtl;
     private TextView instructions;
     private int totalApps;
@@ -147,14 +154,19 @@ final class AppLibraryDialog {
      *  setups are unaffected. See LibraryApps.excludedFromCatalog(). */
     private final Set<String> excludedApps;
 
-    AppLibraryDialog(Activity activity, boolean animations, boolean reducedMotion, boolean selectionMode, boolean okOpens, Predicate<String> onHome, Runnable changed, Runnable dismissed, Set<String> excludedApps) {
+    AppLibraryDialog(Activity activity, boolean animations, boolean reducedMotion, boolean selectionMode, boolean okOpens,
+            List<String> catalogExtras, List<String> catalogExcluded, Predicate<String> onHome, String stockHomePackage,
+            Runnable changed, Runnable dismissed, Set<String> excludedApps) {
         this.activity = activity;
         this.animations = animations;
+        this.catalogExtras = catalogExtras;
+        this.catalogExcluded = new HashSet<>(catalogExcluded);
         this.rtl = activity.getResources().getBoolean(R.bool.rtl_app_grid);
         this.reducedMotion = reducedMotion;
         this.selectionMode = selectionMode;
         this.okOpens = okOpens && !selectionMode;
         this.onHome = onHome;
+        this.stockHomePackage = stockHomePackage == null ? "" : stockHomePackage;
         this.changed = changed;
         this.dismissed = dismissed;
         this.excludedApps = excludedApps;
@@ -233,9 +245,17 @@ final class AppLibraryDialog {
                 for (ResolveInfo info : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(category), 0)) {
                     if (info.activityInfo == null || !info.activityInfo.exported) continue;
                     String pkg = info.activityInfo.packageName;
+                    if (catalogExcluded.contains(pkg) || pkg.equals(self)) continue;
                     if (Intent.CATEGORY_LEANBACK_LAUNCHER.equals(category)) tv.add(pkg);
                     if (!pkg.equals(self) && !LibraryApps.excludedFromCatalog(excludedApps, pkg) && !unique.containsKey(pkg)) unique.put(pkg, info);
                 }
+            }
+            for (String pkg : catalogExtras) {
+                if (pkg.equals(self) || catalogExcluded.contains(pkg) || unique.containsKey(pkg)) continue;
+                ResolveInfo extra = AppAdapter.launchEntry(pm, pkg);
+                if (extra == null) continue;
+                unique.put(pkg, extra);
+                if (pm.getLeanbackLaunchIntentForPackage(pkg) != null) tv.add(pkg);
             }
             Map<String, String> names = new HashMap<>();
             Map<String, Long> installed = new HashMap<>();
@@ -273,7 +293,7 @@ final class AppLibraryDialog {
 
     private void fill(List<ResolveInfo> catalogue) {
         totalApps = catalogue.size();
-        apps = catalogue;
+        apps = new ArrayList<>(catalogue);
         Map<String, Boolean> home = new HashMap<>();
         for (ResolveInfo app : apps) {
             String pkg = app.activityInfo.packageName;
@@ -291,6 +311,26 @@ final class AppLibraryDialog {
             int byLabel = collator.compare(label(a), label(b));
             return byLabel != 0 ? byLabel : pa.compareTo(pb);
         });
+        // HDMI / AV rows from `library_inputs` ("HDMI 1:23"). Added after the sort so they simply follow it, and
+        // left out of the "N apps" count above, which is about apps.
+        String[] inputs = activity.getResources().getStringArray(R.array.library_inputs);
+        for (String row : inputs) {
+            int colon = row.lastIndexOf(':');
+            if (colon <= 0) continue;
+            int source;
+            try {
+                source = Integer.parseInt(row.substring(colon + 1).trim());
+            } catch (NumberFormatException bad) {
+                continue;
+            }
+            ResolveInfo input = new ResolveInfo();
+            input.activityInfo = new ActivityInfo();
+            input.activityInfo.packageName = "input:" + source;
+            input.activityInfo.name = "input";
+            input.nonLocalizedLabel = row.substring(0, colon).trim();
+            input.icon = HdmiPorts.connected(activity, source) ? R.drawable.ic_hdmi : R.drawable.ic_hdmi_dim;
+            apps.add(input);
+        }
         showCatalog();
     }
 
@@ -313,6 +353,12 @@ final class AppLibraryDialog {
     private void bindIcon(ImageView icon, ResolveInfo app) {
         String pkg = app.activityInfo.packageName;
         icon.setTag(pkg);
+        // An HDMI row has no package to load an icon from: it uses the vendor's own artwork, dimmed while nothing
+        // is connected to the port, like the TV's source panel.
+        if (pkg.startsWith(LibraryApps.INPUT_PREFIX)) {
+            icon.setImageDrawable(HdmiPorts.icon(activity, LibraryApps.inputSource(pkg)));
+            return;
+        }
         Drawable cached = icons.get(pkg);
         icon.setImageDrawable(cached);
         if (cached != null || !iconsLoading.add(pkg)) return;
@@ -507,14 +553,50 @@ final class AppLibraryDialog {
 
     private void open(ResolveInfo app) {
         close();
+        String pkg = app.activityInfo.packageName;
+        if (pkg.startsWith("input:")) {
+            openInputSource(pkg);
+            return;
+        }
         Intent intent = new Intent(Intent.ACTION_MAIN).setComponent(
-                new ComponentName(app.activityInfo.packageName, app.activityInfo.name));
-        // TV apps keep the leanback launch intent, so an app already running resumes instead of restarting.
-        if (tvPackages.contains(app.activityInfo.packageName)) intent.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                new ComponentName(pkg, app.activityInfo.name));
+        // The stock launcher's HOME activity is guarded by com.mitv.tvhome.permission.HOME_STATE, a signature
+        // permission only the firmware holds, so it may only be opened through the unguarded sibling. Tapping it
+        // here is a deliberate choice, so the redirect window in HomeKeyService keeps the poll off its back.
+        if (stockHomePackage.equals(pkg)) {
+            HomeKeyService.enterStockHome();
+            if (HomeKeyService.goToStockHome()) return;
+            intent.setClassName(pkg, pkg + ".MainActivity");
+        }
+        // A catalog extra has no launcher category. RESET_TASK_IF_NEEDED on that intent brings Home
+        // back instead of the store. Bring its own task forward.
+        if (catalogExtras.contains(pkg)) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        } else {
+            if (tvPackages.contains(pkg)) intent.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        }
         try { activity.startActivity(intent); }
         catch (ActivityNotFoundException | SecurityException e) {
             Toast.makeText(activity, activity.getString(R.string.cant_open, label(app)), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** An HDMI / AV row: the vendor's own source player, with that port's source number as the int extra. */
+    private void openInputSource(String pkg) {
+        int source;
+        try {
+            source = Integer.parseInt(pkg.substring("input:".length()));
+        } catch (NumberFormatException bad) {
+            return;
+        }
+        String action = activity.getString(R.string.input_action);
+        if (action == null || action.isEmpty()) return;
+        try {
+            activity.startActivity(new Intent(action).putExtra("input", source)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+        } catch (ActivityNotFoundException | SecurityException noPlayer) {
+            Toast.makeText(activity, activity.getString(R.string.not_available), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -539,7 +621,7 @@ final class AppLibraryDialog {
         boolean home = onHome.test(pkg);
         addAction(rows, home ? R.string.library_remove_shortcut : R.string.library_add_home,
                 () -> changeHome(app, !home));
-        Intent info = SystemSettings.appInfo(activity, pkg);
+        Intent info = pkg.startsWith(LibraryApps.INPUT_PREFIX) ? null : SystemSettings.appInfo(activity, pkg);
         if (info != null) addAction(rows, R.string.library_app_info, () -> {
             close();
             try {
@@ -599,7 +681,11 @@ final class AppLibraryDialog {
         view.setGravity(rtl ? Gravity.RIGHT : Gravity.LEFT);
         view.setTextSize(size);
         view.setTextColor(color);
-        view.setTypeface(UiFont.get(activity, R.string.font_medium));
+        if (Build.VERSION.SDK_INT >= 26) {
+            view.setTypeface(activity.getResources().getFont(R.font.outfit_medium));
+        } else {
+            view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        }
         view.setLetterSpacing(0.01f);
         view.setIncludeFontPadding(false);
         return view;
@@ -648,13 +734,20 @@ final class AppLibraryDialog {
             String pkg = app.activityInfo.packageName;
             bindIcon(holder.itemView.findViewById(R.id.icon), app);
             TextView name = holder.itemView.findViewById(R.id.title);
-            name.setText(label(app));
+            boolean input = pkg.startsWith("input:");
+            // An HDMI row carries the same green dot the source panel and the home tile put next to a port
+            // that has a device on it.
+            name.setText(input
+                    ? HdmiPorts.tileName(activity, label(app), LibraryApps.inputSource(pkg), name.getTextSize())
+                    : label(app));
             name.setEllipsize(TextUtils.TruncateAt.END);
             TextView status = holder.itemView.findViewById(R.id.status);
+            // An HDMI row is pinned to Home like an app, so it reports the same three states.
             boolean home = onHome.test(pkg);
-            boolean recent = !selectionMode && LibraryApps.recent(installTimes.getOrDefault(pkg, 0L), catalogTime);
+            boolean recent = !input && !selectionMode && LibraryApps.recent(installTimes.getOrDefault(pkg, 0L), catalogTime);
             status.setText(home ? R.string.library_on_home : recent ? R.string.library_recent : R.string.library_add_home);
-            status.setVisibility(home || !okOpens ? View.VISIBLE : View.INVISIBLE);
+            // An HDMI row reports its state too, so the pinning hint never hides behind okOpens.
+            status.setVisibility(home || !okOpens || input ? View.VISIBLE : View.INVISIBLE);
             holder.itemView.setBackground(surface(home ? 0x1475BBA4 : 0x0CFFFFFF, 18));
             View check = holder.itemView.findViewById(R.id.dot);
             check.getLayoutParams().width = dp(home ? 18 : 8);
@@ -664,8 +757,9 @@ final class AppLibraryDialog {
             check.setVisibility(home || recent ? View.VISIBLE : View.GONE);
             holder.itemView.setOnClickListener(v -> {
                 boolean onHomeNow = onHome.test(pkg);
-                if (LibraryApps.okOpens(selectionMode, okOpens, onHomeNow)) open(app);
-                else changeHome(app, !onHomeNow);
+                if (selectionMode) changeHome(app, !onHomeNow);
+                else if (onHomeNow || catalogExtras.contains(pkg) || LibraryApps.okOpens(selectionMode, okOpens, onHomeNow)) open(app);
+                else changeHome(app, true);
             });
             holder.itemView.setOnLongClickListener(selectionMode ? null : v -> { showActions(app, v); return true; });
             holder.itemView.setOnFocusChangeListener((v, focused) -> {

@@ -7,7 +7,12 @@
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
 
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Android 6 PatchWall does not send window events. The Home helper reads usage stats to see when it
+         is in front. Granted with appops, the same way WRITE_SECURE_SETTINGS is granted with pm grant. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- Needed since Android 10 to read the Wi-Fi network name for the network pill. Never requested at
          runtime: build-and-install grants it with pm grant, so lint's Android 12 "ask for COARSE with
@@ -90,7 +95,8 @@
             <!-- CVTE firmware (ro.CVT_EN_COMMON_HOME_INTENT=1) sends the Home key and boot as MAIN + HOME +
                  COMMON_HOME, which only matches a filter that lists both (#1201). In this one filter, not a second
                  one: a plain HOME intent still matches it, and a second filter could list this activity twice. -->
-            <intent-filter>
+            <!-- MiTV4-ANSM0 keeps priority 999: the stock home (com.mitv.tvhome) declares priority 100. -->
+            <intent-filter android:priority="999">
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.HOME" />
                 <category android:name="android.intent.category.COMMON_HOME" />
@@ -103,6 +109,8 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                <!-- Xiaomi's own app row on Android 6 lists LAUNCHER, not only the leanback category. -->
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
